@@ -103,6 +103,41 @@ finally:
   return result.output || "(no output)";
 }
 
+// ─── Editor state ───────────────────────────────────────────────────────────
+
+type EditorState = {
+  mode: "edit" | "playing" | "simulating" | "unknown";
+  level: string;
+};
+
+async function getEditorState(): Promise<EditorState> {
+  try {
+    const output = await execPythonWithOutput(
+      `import unreal\n` +
+        `el = unreal.EditorLevelLibrary\n` +
+        `world = el.get_editor_world()\n` +
+        `esub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)\n` +
+        `# GEditor play state\n` +
+        `is_playing = unreal.GameplayStatics.get_game_instance(world) is not None\n` +
+        `level = world.get_path_name() if world else "unknown"\n` +
+        `print(f"{'playing' if is_playing else 'edit'}|{level}")`,
+    );
+    const [mode, level] = output.trim().split("|");
+    return {
+      mode: (mode as EditorState["mode"]) ?? "unknown",
+      level: level ?? "unknown",
+    };
+  } catch {
+    // If Python fails entirely, check if UE is even reachable
+    try {
+      await ue("GET", "/remote/info");
+      return { mode: "unknown", level: "unknown" };
+    } catch {
+      return { mode: "unknown", level: "unreachable" };
+    }
+  }
+}
+
 // ─── Result helpers ─────────────────────────────────────────────────────────
 
 type ToolResult = {
@@ -110,21 +145,26 @@ type ToolResult = {
   isError?: true;
 };
 
-function ok(data: unknown): ToolResult {
+function ok(data: unknown, state?: EditorState): ToolResult {
   const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
-  return { content: [{ type: "text", text }] };
+  const prefix = state ? `[UE ${state.mode} | ${state.level}]\n` : "";
+  return { content: [{ type: "text", text: prefix + text }] };
 }
 
-function err(error: unknown): ToolResult {
+function err(error: unknown, state?: EditorState): ToolResult {
   const msg = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+  const prefix = state ? `[UE ${state.mode} | ${state.level}]\n` : "";
+  return {
+    content: [{ type: "text", text: prefix + `Error: ${msg}` }],
+    isError: true,
+  };
 }
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer({
   name: "unreal-engine",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 // ── ue_get_property ─────────────────────────────────────────────────────────
@@ -141,6 +181,7 @@ server.tool(
     property_name: z.string().describe("Property name to read"),
   },
   async ({ object_path, property_name }) => {
+    const state = await getEditorState();
     try {
       return ok(
         await ue("PUT", "/remote/object/property", {
@@ -148,9 +189,10 @@ server.tool(
           access: "READ_ACCESS",
           propertyName: property_name,
         }),
+        state,
       );
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -171,6 +213,10 @@ server.tool(
       ),
   },
   async ({ object_path, property_name, value }) => {
+    const state = await getEditorState();
+    if (state.mode === "playing") {
+      return err("Editor is in Play mode — property writes may not persist. Exit Play mode first.", state);
+    }
     try {
       let parsed: unknown;
       try {
@@ -186,9 +232,10 @@ server.tool(
           propertyName: property_name,
           propertyValue: parsed,
         }),
+        state,
       );
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -219,13 +266,14 @@ server.tool(
       .describe("Record in undo history (default: true)"),
   },
   async ({ object_path, function_name, parameters, generate_transaction }) => {
+    const state = await getEditorState();
     try {
       let params: Record<string, unknown> = {};
       if (parameters) {
         try {
           params = JSON.parse(parameters);
         } catch {
-          return err(`Invalid JSON in parameters: ${parameters}`);
+          return err(`Invalid JSON in parameters: ${parameters}`, state);
         }
       }
 
@@ -236,9 +284,10 @@ server.tool(
           parameters: params,
           generateTransaction: generate_transaction,
         }),
+        state,
       );
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -252,6 +301,7 @@ server.tool(
     object_path: z.string().describe("Full object path"),
   },
   async ({ object_path }) => {
+    const state = await getEditorState();
     try {
       const raw = (await ue("PUT", "/remote/object/describe", {
         objectPath: object_path,
@@ -277,9 +327,9 @@ server.tool(
         })),
       };
 
-      return ok(summary);
+      return ok(summary, state);
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -303,6 +353,7 @@ server.tool(
       .describe('Content path filter (e.g. "/Game/Characters")'),
   },
   async ({ query, class_names, path_filter }) => {
+    const state = await getEditorState();
     try {
       const filter: Record<string, unknown> = {};
       if (class_names) {
@@ -325,9 +376,9 @@ server.tool(
         Path: a.Path,
       }));
 
-      return ok({ Count: compact.length, Assets: compact });
+      return ok({ Count: compact.length, Assets: compact }, state);
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -340,6 +391,7 @@ server.tool(
     "Editor Scripting Utilities plugin.",
   {},
   async () => {
+    const state = await getEditorState();
     try {
       const output = await execPythonWithOutput(`
 import unreal
@@ -348,9 +400,9 @@ for a in actors:
     loc = a.get_actor_location()
     print(f"{a.get_name()} | {a.get_class().get_name()} | ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})")
 `);
-      return ok(output);
+      return ok(output, state);
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -369,6 +421,7 @@ server.tool(
       ),
   },
   async ({ command }) => {
+    const state = await getEditorState();
     try {
       await ue("PUT", "/remote/object/call", {
         objectPath: "/Script/Engine.Default__KismetSystemLibrary",
@@ -380,9 +433,10 @@ server.tool(
       });
       return ok(
         `Console command sent: ${command}\nCheck UE Output Log for results.`,
+        state,
       );
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -403,11 +457,12 @@ server.tool(
       ),
   },
   async ({ code }) => {
+    const state = await getEditorState();
     try {
       const output = await execPythonWithOutput(code);
-      return ok(output);
+      return ok(output, state);
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -428,21 +483,23 @@ server.tool(
       ),
   },
   async ({ requests }) => {
+    const state = await getEditorState();
     try {
       let parsed: unknown[];
       try {
         parsed = JSON.parse(requests);
       } catch {
-        return err(`Invalid JSON array: ${requests.slice(0, 200)}`);
+        return err(`Invalid JSON array: ${requests.slice(0, 200)}`, state);
       }
 
       return ok(
         await ue("PUT", "/remote/batch", {
           requests: parsed,
         }),
+        state,
       );
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -455,10 +512,11 @@ server.tool(
     "Useful for discovering what endpoints are available.",
   {},
   async () => {
+    const state = await getEditorState();
     try {
-      return ok(await ue("GET", "/remote/info"));
+      return ok(await ue("GET", "/remote/info"), state);
     } catch (e) {
-      return err(e);
+      return err(e, state);
     }
   },
 );
@@ -468,7 +526,7 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[unreal-mcp] v0.2.0 ready — target: ${UE_BASE}`);
+  console.error(`[unreal-mcp] v0.3.0 ready — target: ${UE_BASE}`);
 }
 
 main().catch((error) => {
