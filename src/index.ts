@@ -9,17 +9,21 @@
  * Environment variables:
  *   UE_HOST  — Unreal Engine host (default: 127.0.0.1)
  *   UE_PORT  — Remote Control API port (default: 30010)
+ *   UE_SSH_USER — SSH user on the UE host for file readback (default: claude)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execSync } from "child_process";
 import { z } from "zod";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const UE_HOST = process.env.UE_HOST ?? "127.0.0.1";
 const UE_PORT = parseInt(process.env.UE_PORT ?? "30010", 10);
+const UE_SSH_USER = process.env.UE_SSH_USER ?? "claude";
 const UE_BASE = `http://${UE_HOST}:${UE_PORT}`;
+const RESULT_FILE = "C:/tmp/nora_mcp_result.json";
 
 // ─── HTTP helpers ───────────────────────────────────────────────────────────
 
@@ -49,6 +53,58 @@ async function ue(
   }
 }
 
+// ─── SSH helpers ────────────────────────────────────────────────────────────
+
+function sshRead(remotePath: string): string {
+  const escaped = remotePath.replace(/\//g, "\\");
+  return execSync(
+    `ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${UE_SSH_USER}@${UE_HOST} "type ${escaped}"`,
+    { timeout: 10_000, encoding: "utf-8" },
+  );
+}
+
+// ─── Python execution with output capture ───────────────────────────────────
+
+async function execPythonWithOutput(code: string): Promise<string> {
+  // Wrap user code to capture stdout and write to a temp file
+  const wrapper = `
+import sys, io, json, traceback
+_nora_stdout = sys.stdout
+_nora_buf = io.StringIO()
+sys.stdout = _nora_buf
+_nora_err = None
+try:
+    exec(${JSON.stringify(code)})
+except Exception as e:
+    _nora_err = traceback.format_exc()
+finally:
+    sys.stdout = _nora_stdout
+    _nora_out = _nora_buf.getvalue()
+    with open(${JSON.stringify(RESULT_FILE.replace(/\\/g, "/"))}, 'w', encoding='utf-8') as f:
+        json.dump({"output": _nora_out, "error": _nora_err}, f)
+`.trim();
+
+  await ue("PUT", "/remote/object/call", {
+    objectPath: "/Script/PythonScriptPlugin.Default__PythonScriptLibrary",
+    functionName: "ExecutePythonCommand",
+    parameters: { PythonCommand: wrapper },
+  });
+
+  // Small delay for file write to flush
+  await new Promise((r) => setTimeout(r, 200));
+
+  // Read result back via SSH
+  const raw = sshRead(RESULT_FILE);
+  const result = JSON.parse(raw);
+
+  if (result.error) {
+    throw new Error(result.error);
+  }
+  return result.output || "(no output)";
+}
+
+// ─── Result helpers ─────────────────────────────────────────────────────────
+
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: true;
@@ -68,7 +124,7 @@ function err(error: unknown): ToolResult {
 
 const server = new McpServer({
   name: "unreal-engine",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // ── ue_get_property ─────────────────────────────────────────────────────────
@@ -120,7 +176,7 @@ server.tool(
       try {
         parsed = JSON.parse(value);
       } catch {
-        parsed = value; // treat as raw string if not valid JSON
+        parsed = value;
       }
 
       return ok(
@@ -145,13 +201,16 @@ server.tool(
     "functions, use the Default__ object path (e.g. " +
     "/Script/EditorScriptingUtilities.Default__EditorLevelLibrary).",
   {
-    object_path: z.string().describe("Full object path or Default__ class path"),
+    object_path: z
+      .string()
+      .describe("Full object path or Default__ class path"),
     function_name: z.string().describe("Function name to call"),
     parameters: z
       .string()
       .optional()
       .describe(
-        'Function parameters as a JSON object string. Example: \'{"NewLocation":{"X":100,"Y":0,"Z":0}}\'',
+        "Function parameters as a JSON object string. " +
+          'Example: \'{"NewLocation":{"X":100,"Y":0,"Z":0}}\'',
       ),
     generate_transaction: z
       .boolean()
@@ -194,11 +253,31 @@ server.tool(
   },
   async ({ object_path }) => {
     try {
-      return ok(
-        await ue("PUT", "/remote/object/describe", {
-          objectPath: object_path,
-        }),
-      );
+      const raw = (await ue("PUT", "/remote/object/describe", {
+        objectPath: object_path,
+      })) as Record<string, unknown>;
+
+      // Return a compact summary: class + property/function name lists
+      const props = (raw.Properties as Array<Record<string, unknown>>) ?? [];
+      const funcs = (raw.Functions as Array<Record<string, unknown>>) ?? [];
+
+      const summary = {
+        Class: raw.Class,
+        Name: raw.Name,
+        PropertyCount: props.length,
+        Properties: props.map((p) => ({
+          Name: p.Name,
+          Type: p.Type,
+          ...(p.Description ? { Description: p.Description } : {}),
+        })),
+        FunctionCount: funcs.length,
+        Functions: funcs.map((f) => ({
+          Name: f.Name,
+          ...(f.Description ? { Description: f.Description } : {}),
+        })),
+      };
+
+      return ok(summary);
     } catch (e) {
       return err(e);
     }
@@ -233,9 +312,20 @@ server.tool(
         filter.paths = [path_filter];
       }
 
-      return ok(
-        await ue("PUT", "/remote/search/assets", { query, filter }),
-      );
+      const raw = (await ue("PUT", "/remote/search/assets", {
+        query,
+        filter,
+      })) as Record<string, unknown>;
+
+      // Return compact results: name, class, path only (no metadata blob)
+      const assets = (raw.Assets as Array<Record<string, unknown>>) ?? [];
+      const compact = assets.map((a) => ({
+        Name: a.Name,
+        Class: a.Class,
+        Path: a.Path,
+      }));
+
+      return ok({ Count: compact.length, Assets: compact });
     } catch (e) {
       return err(e);
     }
@@ -251,14 +341,14 @@ server.tool(
   {},
   async () => {
     try {
-      return ok(
-        await ue("PUT", "/remote/object/call", {
-          objectPath:
-            "/Script/EditorScriptingUtilities.Default__EditorLevelLibrary",
-          functionName: "GetAllLevelActors",
-          parameters: {},
-        }),
-      );
+      const output = await execPythonWithOutput(`
+import unreal
+actors = unreal.EditorLevelLibrary.get_all_level_actors()
+for a in actors:
+    loc = a.get_actor_location()
+    print(f"{a.get_name()} | {a.get_class().get_name()} | ({loc.x:.0f}, {loc.y:.0f}, {loc.z:.0f})")
+`);
+      return ok(output);
     } catch (e) {
       return err(e);
     }
@@ -280,7 +370,6 @@ server.tool(
   },
   async ({ command }) => {
     try {
-      // Try calling via the GameEngine instance
       await ue("PUT", "/remote/object/call", {
         objectPath: "/Script/Engine.Default__KismetSystemLibrary",
         functionName: "ExecuteConsoleCommand",
@@ -289,7 +378,9 @@ server.tool(
           Command: command,
         },
       });
-      return ok(`Console command sent: ${command}\nCheck UE Output Log for results.`);
+      return ok(
+        `Console command sent: ${command}\nCheck UE Output Log for results.`,
+      );
     } catch (e) {
       return err(e);
     }
@@ -313,31 +404,8 @@ server.tool(
   },
   async ({ code }) => {
     try {
-      // Try the PythonScriptLibrary direct call first
-      try {
-        await ue("PUT", "/remote/object/call", {
-          objectPath:
-            "/Script/PythonScriptPlugin.Default__PythonScriptLibrary",
-          functionName: "ExecutePythonCommand",
-          parameters: { PythonCommand: code },
-        });
-        return ok(
-          `Python executed via PythonScriptLibrary.\nCheck UE Output Log for output.`,
-        );
-      } catch {
-        // Fall back to console command approach
-        await ue("PUT", "/remote/object/call", {
-          objectPath: "/Script/Engine.Default__KismetSystemLibrary",
-          functionName: "ExecuteConsoleCommand",
-          parameters: {
-            WorldContextObject: { objectPath: "" },
-            Command: `py ${code}`,
-          },
-        });
-        return ok(
-          `Python executed via console command.\nCheck UE Output Log for output.`,
-        );
-      }
+      const output = await execPythonWithOutput(code);
+      return ok(output);
     } catch (e) {
       return err(e);
     }
@@ -349,7 +417,8 @@ server.tool(
 server.tool(
   "ue_batch",
   "Execute multiple Remote Control operations in a single HTTP round-trip. " +
-    "Each request is a JSON object for /remote/object/property or /remote/object/call.",
+    "Each request is a JSON object for /remote/object/property or " +
+    "/remote/object/call.",
   {
     requests: z
       .string()
@@ -399,8 +468,7 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Log to stderr so it doesn't interfere with MCP stdio protocol
-  console.error(`[unreal-mcp] Ready — target: ${UE_BASE}`);
+  console.error(`[unreal-mcp] v0.2.0 ready — target: ${UE_BASE}`);
 }
 
 main().catch((error) => {
